@@ -37,8 +37,8 @@ Requirements:
     • OpenCV, NumPy for video I/O
 
 Model Support:
-    • 3B models: seedvr2_ema_3b_fp16.safetensors (default), _fp8_e4m3fn/GGUF variants
-    • 7B models: seedvr2_ema_7b_fp16.safetensors, _fp8_e4m3fn/GGUF variants
+    • 3B models: seedvr2_ema_3b_fp8_e4m3fn.safetensors (default), fp16/GGUF variants
+    • 7B models: seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors, fp16/GGUF variants
     • VAE: ema_vae_fp16.safetensors (shared across all models)
     • Auto-downloads from HuggingFace on first run with SHA256 validation
 """

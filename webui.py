@@ -56,7 +56,7 @@ import numpy as np
 
 # Project imports
 from src.utils.downloads import download_weight
-from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE
+from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE, MODEL_REGISTRY
 from src.utils.constants import SEEDVR2_FOLDER_NAME
 from src.core.generation_utils import (
     setup_generation_context,
@@ -77,6 +77,9 @@ from src.optimization.memory_manager import clear_memory, get_gpu_backend
 
 # Initialize debug instance
 debug = Debug(enabled=False)
+
+# WebUI-specific default model (keeps CLI defaults unchanged)
+DEFAULT_DIT_WEBUI = "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors"
 
 # Global state for model caching
 model_cache: Dict[str, Any] = {}
@@ -196,9 +199,9 @@ def _parse_offload_device(offload_arg: str, platform_type: str = None, cache_ena
 
 def process_image_upscale(
     image_tensor: torch.Tensor,
-    resolution: int = 1080,
-    max_resolution: int = 0,
-    dit_model: str = DEFAULT_DIT,
+    resolution: int = 2160,
+    max_resolution: int = 3584,
+    dit_model: str = DEFAULT_DIT_WEBUI,
     model_dir: Optional[str] = None,
     blocks_to_swap: int = 0,
     swap_io_components: bool = False,
@@ -408,6 +411,59 @@ def process_image_upscale(
 # API Endpoints
 # =============================================================================
 
+def _describe_dit_model(model_name: str) -> Dict[str, Any]:
+    """Build a small metadata payload for UI display."""
+    lower = model_name.lower()
+    model_info = MODEL_REGISTRY.get(model_name)
+
+    # Best-effort size detection (covers both registry + discovered-on-disk models)
+    size = None
+    if model_info and getattr(model_info, "size", None):
+        size = model_info.size
+    elif "7b" in lower:
+        size = "7B"
+    elif "3b" in lower:
+        size = "3B"
+
+    precision = None
+    variant = None
+    repo = None
+    description = None
+
+    if model_info:
+        precision = model_info.precision
+        variant = model_info.variant
+        repo = model_info.repo
+
+    # Human-friendly description (used by the WebUI)
+    precision_descriptions = {
+        "fp16": "FP16 (best quality)",
+        "fp8_e4m3fn": "FP8 8-bit (good quality)",
+        "fp8_e4m3fn_mixed_block35_fp16": "FP8 with last block in FP16 to reduce artifacts (good quality)",
+        "Q4_K_M": "GGUF 4-bit quantized (acceptable quality)",
+        "Q8_0": "GGUF 8-bit quantized (good quality)",
+    }
+
+    if precision:
+        description = precision_descriptions.get(precision, precision)
+    elif model_name.endswith(".gguf"):
+        description = "GGUF quantized"
+    elif model_name.endswith(".safetensors"):
+        description = "Safetensors"
+
+    if variant == "sharp" or "sharp" in lower:
+        description = f"Sharp variant for enhanced detail • {description}" if description else "Sharp variant for enhanced detail"
+        if variant is None:
+            variant = "sharp"
+
+    return {
+        "size": size,
+        "precision": precision,
+        "variant": variant,
+        "repo": repo,
+        "description": description,
+    }
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Serve the main web interface."""
@@ -418,7 +474,8 @@ async def root():
 async def get_models():
     """Get available DiT models."""
     models = get_available_dit_models()
-    return {"models": models, "default": DEFAULT_DIT}
+    info = {name: _describe_dit_model(name) for name in models}
+    return {"models": models, "default": DEFAULT_DIT_WEBUI, "info": info}
 
 
 @app.get("/api/status")
@@ -445,9 +502,9 @@ async def get_status():
 @app.post("/api/upscale")
 async def upscale_image(
     file: UploadFile = File(...),
-    resolution: int = Form(1080),
-    max_resolution: int = Form(0),
-    dit_model: str = Form(DEFAULT_DIT),
+    resolution: int = Form(2160),
+    max_resolution: int = Form(3584),
+    dit_model: str = Form(DEFAULT_DIT_WEBUI),
     color_correction: str = Form("lab"),
     vae_tiling: bool = Form(False),
     vae_tile_size: int = Form(1024),
@@ -527,9 +584,9 @@ async def upscale_image(
 @app.post("/api/upscale_base64")
 async def upscale_image_base64(
     image_base64: str = Form(...),
-    resolution: int = Form(1080),
-    max_resolution: int = Form(0),
-    dit_model: str = Form(DEFAULT_DIT),
+    resolution: int = Form(2160),
+    max_resolution: int = Form(3584),
+    dit_model: str = Form(DEFAULT_DIT_WEBUI),
     color_correction: str = Form("lab"),
     vae_tiling: bool = Form(False),
     vae_tile_size: int = Form(1024),
@@ -1663,16 +1720,16 @@ def get_html_template() -> str:
                     <div class="settings-group">
                         <label class="setting-label">Target Resolution (shortest edge)</label>
                         <div class="range-container">
-                            <input type="range" id="resolution" min="480" max="2160" value="1080" step="120">
-                            <span class="range-value" id="resolution-value">1080px</span>
+                            <input type="range" id="resolution" min="480" max="2160" value="2160" step="120">
+                            <span class="range-value" id="resolution-value">2160px</span>
                         </div>
                     </div>
                     
                     <div class="settings-group">
                         <label class="setting-label">Max Resolution (0 = no limit)</label>
                         <div class="range-container">
-                            <input type="range" id="max-resolution" min="0" max="4096" value="0" step="256">
-                            <span class="range-value" id="max-resolution-value">None</span>
+                            <input type="range" id="max-resolution" min="0" max="4096" value="3584" step="256">
+                            <span class="range-value" id="max-resolution-value">3584px</span>
                         </div>
                     </div>
                     
@@ -1693,6 +1750,15 @@ def get_html_template() -> str:
                         <select id="dit-model">
                             <option value="">Loading models...</option>
                         </select>
+                        <div id="model-info" style="margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-muted); line-height: 1.4;">
+                            Loading model info...
+                        </div>
+                        <details style="margin-top: 0.75rem;">
+                            <summary style="cursor: pointer; font-size: 0.8rem; color: var(--text-secondary);">
+                                Show model details
+                            </summary>
+                            <div id="model-details" style="margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-muted); line-height: 1.4;"></div>
+                        </details>
                     </div>
                     
                     <div class="settings-group">
@@ -1849,19 +1915,19 @@ def get_html_template() -> str:
                                     <tr>
                                         <td><span class="api-param-name">resolution</span></td>
                                         <td><span class="api-param-type">int</span></td>
-                                        <td>1080</td>
+                                        <td>2160</td>
                                         <td>Target resolution for shortest edge</td>
                                     </tr>
                                     <tr>
                                         <td><span class="api-param-name">max_resolution</span></td>
                                         <td><span class="api-param-type">int</span></td>
-                                        <td>0</td>
+                                        <td>3584</td>
                                         <td>Max resolution for any edge (0 = no limit)</td>
                                     </tr>
                                     <tr>
                                         <td><span class="api-param-name">dit_model</span></td>
                                         <td><span class="api-param-type">string</span></td>
-                                        <td>seedvr2_ema_3b_fp8_e4m3fn.safetensors</td>
+                                        <td>seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors</td>
                                         <td>Model to use for upscaling</td>
                                     </tr>
                                     <tr>
@@ -1899,7 +1965,8 @@ X-Output-Resolution: 1920x1080</div>
                             <h4 style="margin-top: 1rem;">Example (cURL)</h4>
                             <div class="code-block">curl -X POST "http://localhost:8000/api/upscale" \\
   -F "file=@image.jpg" \\
-  -F "resolution=1080" \\
+  -F "resolution=2160" \\
+  -F "max_resolution=3584" \\
   -F "color_correction=lab" \\
   -o upscaled.png</div>
                             
@@ -1910,7 +1977,8 @@ response = requests.post(
     <span class="string">"http://localhost:8000/api/upscale"</span>,
     files={<span class="string">"file"</span>: open(<span class="string">"image.jpg"</span>, <span class="string">"rb"</span>)},
     data={
-        <span class="string">"resolution"</span>: <span class="number">1080</span>,
+        <span class="string">"resolution"</span>: <span class="number">2160</span>,
+        <span class="string">"max_resolution"</span>: <span class="number">3584</span>,
         <span class="string">"color_correction"</span>: <span class="string">"lab"</span>
     }
 )
@@ -1975,7 +2043,7 @@ response = requests.post(
     <span class="string">"seedvr2_ema_7b_fp8_e4m3fn.safetensors"</span>,
     ...
   ],
-  <span class="string">"default"</span>: <span class="string">"seedvr2_ema_3b_fp8_e4m3fn.safetensors"</span>
+  <span class="string">"default"</span>: <span class="string">"seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors"</span>
 }</div>
                         </div>
                     </div>
@@ -2057,6 +2125,86 @@ response = requests.post(
         const blocksSlider = document.getElementById('blocks-to-swap');
         const blocksValue = document.getElementById('blocks-value');
         const advancedSettings = document.getElementById('advanced-settings');
+        const modelInfoText = document.getElementById('model-info');
+        const modelDetails = document.getElementById('model-details');
+        
+        // Model metadata (populated from /api/models)
+        let modelInfoMap = {};
+        
+        function escapeHtml(str) {
+            return (str || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+        
+        function getShortName(model) {
+            return model
+                .replace('seedvr2_ema_', '')
+                .replace('.safetensors', '')
+                .replace('.gguf', ' (GGUF)');
+        }
+        
+        function updateModelInfo() {
+            if (!modelInfoText) return;
+            
+            const model = ditModelSelect.value;
+            if (!model) {
+                modelInfoText.textContent = '';
+                return;
+            }
+            
+            const info = modelInfoMap[model];
+            const parts = [];
+            if (info && info.size) parts.push(info.size);
+            if (info && info.description) parts.push(info.description);
+            
+            modelInfoText.textContent = parts.length > 0
+                ? parts.join(' • ')
+                : 'No metadata available for this model.';
+        }
+        
+        function renderModelDetails(models) {
+            if (!modelDetails) return;
+            if (!models || models.length === 0) {
+                modelDetails.textContent = 'No models found.';
+                return;
+            }
+            
+            const groups = { "7B": [], "3B": [], "Other": [] };
+            
+            models.forEach(m => {
+                const info = modelInfoMap[m] || {};
+                const lower = (m || '').toLowerCase();
+                const size = info.size || (lower.includes('7b') ? '7B' : (lower.includes('3b') ? '3B' : 'Other'));
+                (groups[size] || groups.Other).push(m);
+            });
+            
+            const order = ['7B', '3B', 'Other'];
+            let html = '';
+            
+            order.forEach(size => {
+                const list = groups[size] || [];
+                if (list.length === 0) return;
+                
+                const title = size === 'Other' ? 'Other models' : (size + ' models');
+                html +=
+                    '<div style="margin-top: 0.5rem;">' +
+                        '<div style="font-weight: 600; color: var(--text-secondary); margin-bottom: 0.25rem;">' + title + '</div>' +
+                        '<ul style="margin: 0; padding-left: 1.1rem;">' +
+                            list.map(m => {
+                                const info = modelInfoMap[m] || {};
+                                const desc = info.description ? (' — ' + escapeHtml(info.description)) : '';
+                                return '<li><span style="font-family: var(--font-mono);">' + escapeHtml(m) + '</span>' + desc + '</li>';
+                            }).join('') +
+                        '</ul>' +
+                    '</div>';
+            });
+            
+            modelDetails.innerHTML = html;
+        }
         
         // Initialize
         async function init() {
@@ -2067,11 +2215,18 @@ response = requests.post(
                 const response = await fetch('/api/models');
                 const data = await response.json();
                 
+                modelInfoMap = data.info || {};
+                
                 ditModelSelect.innerHTML = data.models.map(model => {
                     // Shorten model names for display
-                    const shortName = model.replace('seedvr2_ema_', '').replace('.safetensors', '').replace('.gguf', ' (GGUF)');
-                    return '<option value="' + model + '"' + (model === data.default ? ' selected' : '') + '>' + shortName + '</option>';
+                    const shortName = getShortName(model);
+                    const info = modelInfoMap[model];
+                    const label = (info && info.size) ? ('[' + info.size + '] ' + shortName) : shortName;
+                    return '<option value="' + model + '"' + (model === data.default ? ' selected' : '') + '>' + label + '</option>';
                 }).join('');
+                
+                updateModelInfo();
+                renderModelDetails(data.models);
             } catch (e) {
                 console.error('Failed to fetch models:', e);
             }
@@ -2104,6 +2259,8 @@ response = requests.post(
         }
         
         // Event listeners
+        ditModelSelect.addEventListener('change', updateModelInfo);
+        
         uploadZone.addEventListener('click', (e) => {
             if (!imagePreview.classList.contains('active')) {
                 fileInput.click();
