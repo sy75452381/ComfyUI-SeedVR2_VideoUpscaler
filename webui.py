@@ -200,13 +200,13 @@ def _parse_offload_device(offload_arg: str, platform_type: str = None, cache_ena
 def process_image_upscale(
     image_tensor: torch.Tensor,
     resolution: int = 2160,
-    max_resolution: int = 3584,
+    max_resolution: int = 4096,
     dit_model: str = DEFAULT_DIT_WEBUI,
     model_dir: Optional[str] = None,
     blocks_to_swap: int = 0,
     swap_io_components: bool = False,
-    vae_encode_tiled: bool = False,
-    vae_decode_tiled: bool = False,
+    vae_encode_tiled: bool = True,
+    vae_decode_tiled: bool = True,
     vae_tile_size: int = 1024,
     vae_tile_overlap: int = 128,
     color_correction: str = "lab",
@@ -503,10 +503,10 @@ async def get_status():
 async def upscale_image(
     file: UploadFile = File(...),
     resolution: int = Form(2160),
-    max_resolution: int = Form(3584),
+    max_resolution: int = Form(4096),
     dit_model: str = Form(DEFAULT_DIT_WEBUI),
     color_correction: str = Form("lab"),
-    vae_tiling: bool = Form(False),
+    vae_tiling: bool = Form(True),
     vae_tile_size: int = Form(1024),
     blocks_to_swap: int = Form(0),
     seed: int = Form(42),
@@ -585,10 +585,10 @@ async def upscale_image(
 async def upscale_image_base64(
     image_base64: str = Form(...),
     resolution: int = Form(2160),
-    max_resolution: int = Form(3584),
+    max_resolution: int = Form(4096),
     dit_model: str = Form(DEFAULT_DIT_WEBUI),
     color_correction: str = Form("lab"),
-    vae_tiling: bool = Form(False),
+    vae_tiling: bool = Form(True),
     vae_tile_size: int = Form(1024),
     blocks_to_swap: int = Form(0),
     seed: int = Form(42)
@@ -1728,8 +1728,8 @@ def get_html_template() -> str:
                     <div class="settings-group">
                         <label class="setting-label">Max Resolution (0 = no limit)</label>
                         <div class="range-container">
-                            <input type="range" id="max-resolution" min="0" max="4096" value="3584" step="256">
-                            <span class="range-value" id="max-resolution-value">3584px</span>
+                            <input type="range" id="max-resolution" min="0" max="4096" value="4096" step="256">
+                            <span class="range-value" id="max-resolution-value">4096px</span>
                         </div>
                     </div>
                     
@@ -1778,7 +1778,7 @@ def get_html_template() -> str:
                                 <div class="toggle-container">
                                     <span class="setting-label" style="margin-bottom: 0;">VAE Tiling</span>
                                     <label class="toggle">
-                                        <input type="checkbox" id="vae-tiling">
+                                        <input type="checkbox" id="vae-tiling" checked>
                                         <span class="toggle-slider"></span>
                                     </label>
                                 </div>
@@ -1921,7 +1921,7 @@ def get_html_template() -> str:
                                     <tr>
                                         <td><span class="api-param-name">max_resolution</span></td>
                                         <td><span class="api-param-type">int</span></td>
-                                        <td>3584</td>
+                                        <td>4096</td>
                                         <td>Max resolution for any edge (0 = no limit)</td>
                                     </tr>
                                     <tr>
@@ -1939,7 +1939,7 @@ def get_html_template() -> str:
                                     <tr>
                                         <td><span class="api-param-name">vae_tiling</span></td>
                                         <td><span class="api-param-type">bool</span></td>
-                                        <td>false</td>
+                                        <td>true</td>
                                         <td>Enable VAE tiling for high resolution</td>
                                     </tr>
                                     <tr>
@@ -1966,7 +1966,7 @@ X-Output-Resolution: 1920x1080</div>
                             <div class="code-block">curl -X POST "http://localhost:8000/api/upscale" \\
   -F "file=@image.jpg" \\
   -F "resolution=2160" \\
-  -F "max_resolution=3584" \\
+  -F "max_resolution=4096" \\
   -F "color_correction=lab" \\
   -o upscaled.png</div>
                             
@@ -1978,7 +1978,7 @@ response = requests.post(
     files={<span class="string">"file"</span>: open(<span class="string">"image.jpg"</span>, <span class="string">"rb"</span>)},
     data={
         <span class="string">"resolution"</span>: <span class="number">2160</span>,
-        <span class="string">"max_resolution"</span>: <span class="number">3584</span>,
+        <span class="string">"max_resolution"</span>: <span class="number">4096</span>,
         <span class="string">"color_correction"</span>: <span class="string">"lab"</span>
     }
 )
