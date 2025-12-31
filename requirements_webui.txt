@@ -21,4 +21,5 @@ rotary_embedding_torch>=0.5.3
 opencv-python
 gguf
 matplotlib
-
+imageio
+imagecodecs

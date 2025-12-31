@@ -26,6 +26,7 @@ import uuid
 import asyncio
 import argparse
 import platform
+import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -53,6 +54,8 @@ import uvicorn
 import torch
 import cv2
 import numpy as np
+import imageio
+import imagecodecs
 
 # Project imports
 from src.utils.downloads import download_weight
@@ -85,6 +88,10 @@ DEFAULT_DIT_WEBUI = "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors"
 model_cache: Dict[str, Any] = {}
 current_loaded_model: Optional[str] = None  # Track which DiT model is loaded
 
+# Ensure outputs directory exists
+OUTPUTS_DIR = os.path.join(os.getcwd(), "outputs")
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
 app = FastAPI(
     title="SeedVR2 Image Upscaler",
     description="High-quality AI image upscaling using SeedVR2 diffusion models",
@@ -100,6 +107,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount outputs directory
+app.mount("/outputs", StaticFiles(directory=OUTPUTS_DIR), name="outputs")
+
 
 # =============================================================================
 # Core Processing Functions
@@ -108,20 +118,20 @@ app.add_middleware(
 def extract_image_tensor(image_bytes: bytes) -> torch.Tensor:
     """
     Convert image bytes to tensor format for processing.
-    
+
     Args:
         image_bytes: Raw image bytes from upload
-        
+
     Returns:
         Image tensor [1, H, W, C] in Float16, range [0,1]
     """
     # Decode image from bytes
     nparr = np.frombuffer(image_bytes, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
-    
+
     if frame is None:
         raise ValueError("Could not decode image file")
-    
+
     # Convert BGR(A) to RGB(A)
     if len(frame.shape) == 3:
         if frame.shape[2] == 4:
@@ -131,55 +141,101 @@ def extract_image_tensor(image_bytes: bytes) -> torch.Tensor:
     else:
         # Grayscale - convert to RGB
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-    
+
     # Normalize to [0, 1] and convert to tensor
     frame = frame.astype(np.float32) / 255.0
     frames_tensor = torch.from_numpy(frame[None, ...]).to(torch.float16)
-    
+
     return frames_tensor
 
 
 def tensor_to_png_bytes(tensor: torch.Tensor) -> bytes:
     """
     Convert output tensor to PNG bytes.
-    
+
     Args:
         tensor: Image tensor [T, H, W, C] in range [0,1]
-        
+
     Returns:
         PNG-encoded bytes
     """
     # Get first frame (for single image processing)
     frame = tensor[0].cpu().numpy()
-    
+
     # Convert to uint8
     frame_uint8 = (frame * 255.0).clip(0, 255).astype(np.uint8)
-    
+
     # Handle RGBA vs RGB
     if frame_uint8.shape[-1] == 4:
         frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGBA2BGRA)
     else:
         frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
-    
+
     # Encode as PNG
     success, encoded = cv2.imencode('.png', frame_bgr)
     if not success:
         raise ValueError("Failed to encode output image")
-    
+
     return encoded.tobytes()
+
+
+def save_image_to_disk(tensor: torch.Tensor, format: str) -> str:
+    """
+    Save image tensor to disk in specified format.
+
+    Args:
+        tensor: Image tensor [1, H, W, C]
+        format: Output format ('png', 'jpeg', 'jxl')
+
+    Returns:
+        Filename of saved image
+    """
+    # Get frame
+    frame = tensor[0].cpu().numpy()
+    frame_uint8 = (frame * 255.0).clip(0, 255).astype(np.uint8)
+
+    # Generate filename
+    ext = format.lower()
+    if ext == 'jpeg': ext = 'jpg'
+    filename = f"upscaled_{uuid.uuid4().hex}.{ext}"
+    filepath = os.path.join(OUTPUTS_DIR, filename)
+
+    if format == 'jxl':
+        # Use imageio with imagecodecs for JXL
+        try:
+            # ImageIO expects RGB, not BGR
+            # Our tensor is RGB, but if we used cv2 conversions before we need to be careful.
+            # tensor is [H, W, C] RGB(A)
+            imageio.imwrite(filepath, frame_uint8, format='jxl')
+        except Exception as e:
+            # Fallback if possible or raise
+            raise ValueError(f"Failed to save JXL: {e}")
+    else:
+        # Use OpenCV for standard formats
+        if frame_uint8.shape[-1] == 4:
+            frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGBA2BGRA)
+        else:
+            frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
+
+        if format == 'jpeg' or format == 'jpg':
+            cv2.imwrite(filepath, frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        else:
+            cv2.imwrite(filepath, frame_bgr)
+
+    return filename
 
 
 def _device_id_to_name(device_id: str, platform_type: str = None) -> str:
     """Convert device ID to full device name."""
     if device_id in ("cpu", "none"):
         return device_id
-    
+
     if platform_type is None:
         platform_type = get_gpu_backend()
-    
+
     if platform_type == "mps":
         return "mps"
-    
+
     return f"{platform_type}:{device_id}"
 
 
@@ -187,13 +243,13 @@ def _parse_offload_device(offload_arg: str, platform_type: str = None, cache_ena
     """Parse offload device argument to full device name."""
     if offload_arg == "none":
         return "cpu" if cache_enabled else None
-    
+
     if offload_arg == "cpu":
         return "cpu"
-    
+
     if ":" in offload_arg:
         return offload_arg
-    
+
     return _device_id_to_name(offload_arg, platform_type)
 
 
@@ -216,7 +272,7 @@ def process_image_upscale(
 ) -> torch.Tensor:
     """
     Process a single image through the SeedVR2 upscaling pipeline.
-    
+
     Args:
         image_tensor: Input image tensor [1, H, W, C]
         resolution: Target resolution for shortest edge
@@ -233,25 +289,25 @@ def process_image_upscale(
         seed: Random seed
         cache_models: Whether to cache models between requests
         progress_callback: Optional callback for progress updates
-        
+
     Returns:
         Upscaled image tensor [1, H', W', C]
     """
     global model_cache, current_loaded_model
-    
+
     # Check if model has changed - if so, clear the cache first
     if current_loaded_model is not None and current_loaded_model != dit_model:
-        debug.log(f"Model changed from {current_loaded_model} to {dit_model}, clearing cache...", 
+        debug.log(f"Model changed from {current_loaded_model} to {dit_model}, clearing cache...",
                   category="cache", force=True)
         model_cache = {}
         clear_memory(debug=debug, deep=True, force=True)
         current_loaded_model = None
-    
+
     # Determine platform and device
     platform_type = get_gpu_backend()
     device_id = "0"
     inference_device = _device_id_to_name(device_id, platform_type)
-    
+
     # Configure offload devices
     # When caching models, we keep them on GPU (no offload) unless BlockSwap is used
     # This ensures fast subsequent requests by avoiding CPU<->GPU transfers
@@ -264,11 +320,11 @@ def process_image_upscale(
         dit_offload = _parse_offload_device("cpu" if blocks_to_swap > 0 else "none", platform_type, cache_models)
         vae_offload = _parse_offload_device("cpu" if cache_models else "none", platform_type, cache_models)
     tensor_offload = _parse_offload_device("cpu", platform_type, False)
-    
+
     # Model directory
     if model_dir is None:
         model_dir = f"./models/{SEEDVR2_FOLDER_NAME}"
-    
+
     # Setup or reuse generation context
     if cache_models and 'ctx' in model_cache:
         ctx = model_cache['ctx']
@@ -289,11 +345,11 @@ def process_image_upscale(
         )
         if cache_models:
             model_cache['ctx'] = ctx
-    
+
     # Prepare runner with caching support
     dit_id = "webui_dit" if cache_models else None
     vae_id = "webui_vae" if cache_models else None
-    
+
     runner, cache_context = prepare_runner(
         dit_model=dit_model,
         vae_model=DEFAULT_VAE,
@@ -318,15 +374,15 @@ def process_image_upscale(
         tile_debug="false",
         attention_mode="sdpa"
     )
-    
+
     ctx['cache_context'] = cache_context
     if cache_models:
         model_cache['runner'] = runner
         current_loaded_model = dit_model  # Track loaded model for cache invalidation
-    
+
     # Load text embeddings
     ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
-    
+
     # Compute generation info
     image_tensor, gen_info = compute_generation_info(
         ctx=ctx,
@@ -341,12 +397,12 @@ def process_image_upscale(
         debug=debug
     )
     log_generation_start(gen_info, debug)
-    
+
     # Progress updates
     def progress_wrapper(current, total, frames, phase):
         if progress_callback:
             progress_callback(phase, current, total)
-    
+
     # Phase 1: Encode
     if progress_callback:
         progress_callback("Encoding", 0, 1)
@@ -363,7 +419,7 @@ def process_image_upscale(
         input_noise_scale=0.0,
         color_correction=color_correction
     )
-    
+
     # Phase 2: Upscale
     if progress_callback:
         progress_callback("Upscaling", 0, 1)
@@ -374,7 +430,7 @@ def process_image_upscale(
         latent_noise_scale=0.0,
         cache_model=cache_models
     )
-    
+
     # Phase 3: Decode
     if progress_callback:
         progress_callback("Decoding", 0, 1)
@@ -383,7 +439,7 @@ def process_image_upscale(
         progress_callback=progress_wrapper,
         cache_model=cache_models
     )
-    
+
     # Phase 4: Post-process
     if progress_callback:
         progress_callback("Post-processing", 0, 1)
@@ -395,15 +451,15 @@ def process_image_upscale(
         temporal_overlap=0,
         batch_size=1
     )
-    
+
     result_tensor = ctx['final_video']
-    
+
     # Convert to CPU and compatible dtype
     if result_tensor.is_cuda or (hasattr(result_tensor, 'is_mps') and result_tensor.is_mps):
         result_tensor = result_tensor.cpu()
     if result_tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
         result_tensor = result_tensor.to(torch.float32)
-    
+
     return result_tensor
 
 
@@ -482,14 +538,14 @@ async def get_models():
 async def get_status():
     """Get current system status."""
     gpu_backend = get_gpu_backend()
-    
+
     gpu_info = "No GPU available"
     if gpu_backend == "cuda":
         if torch.cuda.is_available():
             gpu_info = f"{torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory // 1024**3}GB)"
     elif gpu_backend == "mps":
         gpu_info = "Apple Silicon (MPS)"
-    
+
     return {
         "status": "ready",
         "gpu_backend": gpu_backend,
@@ -510,11 +566,12 @@ async def upscale_image(
     vae_tile_size: int = Form(1024),
     blocks_to_swap: int = Form(0),
     seed: int = Form(42),
-    cache_models: bool = Form(True)
+    cache_models: bool = Form(True),
+    output_format: str = Form("png")
 ):
     """
     Upscale an image using SeedVR2.
-    
+
     Args:
         file: Image file to upscale (PNG, JPG, WEBP)
         resolution: Target resolution for shortest edge
@@ -525,25 +582,30 @@ async def upscale_image(
         vae_tile_size: Tile size for VAE tiling
         blocks_to_swap: Transformer blocks to swap for VRAM savings
         seed: Random seed for reproducibility
-        
+        output_format: Output image format (png, jpeg, jxl)
+
     Returns:
-        Upscaled image as PNG
+        JSON with filename and download URL
     """
     # Validate file type
     allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp", "image/tiff"}
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
-    
+
+    # Validate output format
+    if output_format not in ("png", "jpeg", "jxl"):
+        output_format = "png"
+
     try:
         # Read and process image
         image_bytes = await file.read()
         image_tensor = extract_image_tensor(image_bytes)
-        
+
         # Download models if needed
         model_dir = f"./models/{SEEDVR2_FOLDER_NAME}"
         if not download_weight(dit_model=dit_model, vae_model=DEFAULT_VAE, model_dir=None, debug=debug):
             raise HTTPException(status_code=500, detail="Failed to download required models")
-        
+
         # Process image
         start_time = time.time()
         result = process_image_upscale(
@@ -562,21 +624,17 @@ async def upscale_image(
             cache_models=cache_models
         )
         process_time = time.time() - start_time
-        
-        # Convert to PNG bytes
-        output_bytes = tensor_to_png_bytes(result)
-        
-        # Return as downloadable image
-        return StreamingResponse(
-            io.BytesIO(output_bytes),
-            media_type="image/png",
-            headers={
-                "Content-Disposition": f"attachment; filename=upscaled_{Path(file.filename).stem}.png",
-                "X-Processing-Time": f"{process_time:.2f}s",
-                "X-Output-Resolution": f"{result.shape[2]}x{result.shape[1]}"
-            }
-        )
-        
+
+        # Save to disk
+        filename = save_image_to_disk(result, output_format)
+
+        return {
+            "filename": filename,
+            "url": f"/outputs/{filename}",
+            "processing_time": f"{process_time:.2f}s",
+            "output_resolution": f"{result.shape[2]}x{result.shape[1]}"
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -595,7 +653,7 @@ async def upscale_image_base64(
 ):
     """
     Upscale an image from base64 string.
-    
+
     Returns JSON with base64-encoded result.
     """
     try:
@@ -604,12 +662,12 @@ async def upscale_image_base64(
             image_base64 = image_base64.split(",")[1]
         image_bytes = base64.b64decode(image_base64)
         image_tensor = extract_image_tensor(image_bytes)
-        
+
         # Download models if needed
         model_dir = f"./models/{SEEDVR2_FOLDER_NAME}"
         if not download_weight(dit_model=dit_model, vae_model=DEFAULT_VAE, model_dir=None, debug=debug):
             raise HTTPException(status_code=500, detail="Failed to download required models")
-        
+
         # Process image
         start_time = time.time()
         result = process_image_upscale(
@@ -628,18 +686,18 @@ async def upscale_image_base64(
             cache_models=True
         )
         process_time = time.time() - start_time
-        
+
         # Convert to base64
         output_bytes = tensor_to_png_bytes(result)
         output_base64 = base64.b64encode(output_bytes).decode('utf-8')
-        
+
         return {
             "success": True,
             "image": f"data:image/png;base64,{output_base64}",
             "processing_time": f"{process_time:.2f}s",
             "output_resolution": f"{result.shape[2]}x{result.shape[1]}"
         }
-        
+
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -664,6 +722,23 @@ async def clear_cache():
     current_loaded_model = None
     clear_memory(debug=debug, deep=True, force=True)
     return {"status": "success", "message": "Model cache cleared"}
+
+@app.post("/api/clear_outputs")
+async def clear_outputs():
+    """Clear all generated images from the output directory."""
+    try:
+        for filename in os.listdir(OUTPUTS_DIR):
+            file_path = os.path.join(OUTPUTS_DIR, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                print(f'Failed to delete {file_path}. Reason: {e}')
+        return {"status": "success", "message": "Output directory cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
@@ -703,17 +778,17 @@ def get_html_template() -> str:
             --font-sans: 'Sora', -apple-system, BlinkMacSystemFont, sans-serif;
             --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
         }
-        
+
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
-        
+
         html, body {
             height: 100%;
         }
-        
+
         body {
             font-family: var(--font-sans);
             background: var(--bg-primary);
@@ -721,7 +796,7 @@ def get_html_template() -> str:
             line-height: 1.6;
             overflow-x: hidden;
         }
-        
+
         /* Background effects */
         .bg-gradient {
             position: fixed;
@@ -729,14 +804,14 @@ def get_html_template() -> str:
             left: 0;
             right: 0;
             bottom: 0;
-            background: 
+            background:
                 radial-gradient(ellipse at 20% 20%, rgba(99, 102, 241, 0.12) 0%, transparent 50%),
                 radial-gradient(ellipse at 80% 80%, rgba(139, 92, 246, 0.1) 0%, transparent 50%),
                 radial-gradient(ellipse at 50% 50%, rgba(168, 85, 247, 0.05) 0%, transparent 70%);
             pointer-events: none;
             z-index: -1;
         }
-        
+
         .noise-overlay {
             position: fixed;
             top: 0;
@@ -748,7 +823,7 @@ def get_html_template() -> str:
             pointer-events: none;
             z-index: -1;
         }
-        
+
         /* Main container */
         .container {
             max-width: 1400px;
@@ -758,21 +833,21 @@ def get_html_template() -> str:
             display: flex;
             flex-direction: column;
         }
-        
+
         /* Header */
         header {
             text-align: center;
             margin-bottom: 3rem;
             animation: fadeInDown 0.6s ease-out;
         }
-        
+
         .logo {
             display: inline-flex;
             align-items: center;
             gap: 0.75rem;
             margin-bottom: 0.5rem;
         }
-        
+
         .logo-icon {
             width: 48px;
             height: 48px;
@@ -784,7 +859,7 @@ def get_html_template() -> str:
             font-size: 1.5rem;
             box-shadow: 0 8px 32px rgba(99, 102, 241, 0.4);
         }
-        
+
         h1 {
             font-size: 2.5rem;
             font-weight: 700;
@@ -794,13 +869,13 @@ def get_html_template() -> str:
             background-clip: text;
             letter-spacing: -0.02em;
         }
-        
+
         .subtitle {
             color: var(--text-secondary);
             font-size: 1.1rem;
             font-weight: 300;
         }
-        
+
         /* Status bar */
         .status-bar {
             display: flex;
@@ -816,13 +891,13 @@ def get_html_template() -> str:
             font-size: 0.85rem;
             animation: fadeIn 0.6s ease-out 0.1s both;
         }
-        
+
         .status-item {
             display: flex;
             align-items: center;
             gap: 0.5rem;
         }
-        
+
         .status-dot {
             width: 8px;
             height: 8px;
@@ -830,10 +905,10 @@ def get_html_template() -> str:
             background: var(--success);
             animation: pulse 2s infinite;
         }
-        
+
         .status-dot.warning { background: var(--warning); }
         .status-dot.error { background: var(--error); }
-        
+
         /* Main grid */
         .main-grid {
             display: grid;
@@ -842,13 +917,13 @@ def get_html_template() -> str:
             flex: 1;
             animation: fadeIn 0.6s ease-out 0.2s both;
         }
-        
+
         @media (max-width: 1024px) {
             .main-grid {
                 grid-template-columns: 1fr;
             }
         }
-        
+
         /* Panels */
         .panel {
             background: var(--bg-secondary);
@@ -856,7 +931,7 @@ def get_html_template() -> str:
             border-radius: 16px;
             overflow: hidden;
         }
-        
+
         .panel-header {
             padding: 1.25rem 1.5rem;
             border-bottom: 1px solid var(--border-color);
@@ -864,7 +939,7 @@ def get_html_template() -> str:
             align-items: center;
             justify-content: space-between;
         }
-        
+
         .panel-title {
             font-size: 1rem;
             font-weight: 600;
@@ -872,11 +947,11 @@ def get_html_template() -> str:
             align-items: center;
             gap: 0.5rem;
         }
-        
+
         .panel-content {
             padding: 1.5rem;
         }
-        
+
         /* Upload area */
         .upload-zone {
             position: relative;
@@ -891,45 +966,45 @@ def get_html_template() -> str:
             cursor: pointer;
             transition: all 0.3s ease;
         }
-        
+
         .upload-zone:hover, .upload-zone.dragover {
             border-color: var(--accent-primary);
             background: rgba(99, 102, 241, 0.05);
         }
-        
+
         .upload-zone.has-image {
             border-style: solid;
             cursor: default;
         }
-        
+
         .upload-zone.has-image .upload-icon,
         .upload-zone.has-image .upload-text,
         .upload-zone.has-image .upload-hint {
             display: none;
         }
-        
+
         .upload-icon {
             width: 80px;
             height: 80px;
             margin-bottom: 1.5rem;
             opacity: 0.5;
         }
-        
+
         .upload-text {
             font-size: 1.1rem;
             color: var(--text-secondary);
             margin-bottom: 0.5rem;
         }
-        
+
         .upload-hint {
             font-size: 0.85rem;
             color: var(--text-muted);
         }
-        
+
         #file-input {
             display: none;
         }
-        
+
         /* Image preview */
         .image-preview {
             display: none;
@@ -937,11 +1012,11 @@ def get_html_template() -> str:
             width: 100%;
             height: 100%;
         }
-        
+
         .image-preview.active {
             display: block;
         }
-        
+
         .preview-container {
             position: relative;
             width: 100%;
@@ -952,14 +1027,14 @@ def get_html_template() -> str:
             justify-content: center;
             overflow: hidden;
         }
-        
+
         .preview-img {
             width: 100%;
             height: 100%;
             object-fit: contain;
             border-radius: 8px;
         }
-        
+
         .image-info {
             position: absolute;
             bottom: 1rem;
@@ -971,7 +1046,7 @@ def get_html_template() -> str:
             font-family: var(--font-mono);
             font-size: 0.8rem;
         }
-        
+
         .clear-btn {
             position: absolute;
             top: 1rem;
@@ -988,20 +1063,20 @@ def get_html_template() -> str:
             justify-content: center;
             transition: all 0.2s ease;
         }
-        
+
         .clear-btn:hover {
             background: var(--error);
         }
-        
+
         /* Settings panel */
         .settings-group {
             margin-bottom: 1.5rem;
         }
-        
+
         .settings-group:last-child {
             margin-bottom: 0;
         }
-        
+
         .setting-label {
             display: block;
             font-size: 0.85rem;
@@ -1009,13 +1084,13 @@ def get_html_template() -> str:
             margin-bottom: 0.5rem;
             color: var(--text-secondary);
         }
-        
+
         .setting-row {
             display: flex;
             align-items: center;
             gap: 1rem;
         }
-        
+
         /* Form inputs */
         input[type="number"],
         input[type="text"],
@@ -1030,20 +1105,20 @@ def get_html_template() -> str:
             font-size: 0.9rem;
             transition: all 0.2s ease;
         }
-        
+
         input:focus, select:focus {
             outline: none;
             border-color: var(--accent-primary);
             box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
         }
-        
+
         /* Range slider */
         .range-container {
             display: flex;
             align-items: center;
             gap: 1rem;
         }
-        
+
         input[type="range"] {
             flex: 1;
             -webkit-appearance: none;
@@ -1052,7 +1127,7 @@ def get_html_template() -> str:
             border-radius: 3px;
             cursor: pointer;
         }
-        
+
         input[type="range"]::-webkit-slider-thumb {
             -webkit-appearance: none;
             width: 18px;
@@ -1062,7 +1137,7 @@ def get_html_template() -> str:
             cursor: grab;
             box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
         }
-        
+
         .range-value {
             font-family: var(--font-mono);
             font-size: 0.9rem;
@@ -1070,26 +1145,26 @@ def get_html_template() -> str:
             text-align: right;
             color: var(--text-secondary);
         }
-        
+
         /* Toggle switch */
         .toggle-container {
             display: flex;
             align-items: center;
             justify-content: space-between;
         }
-        
+
         .toggle {
             position: relative;
             width: 48px;
             height: 26px;
         }
-        
+
         .toggle input {
             opacity: 0;
             width: 0;
             height: 0;
         }
-        
+
         .toggle-slider {
             position: absolute;
             cursor: pointer;
@@ -1102,7 +1177,7 @@ def get_html_template() -> str:
             border-radius: 26px;
             transition: all 0.3s ease;
         }
-        
+
         .toggle-slider:before {
             content: "";
             position: absolute;
@@ -1114,17 +1189,17 @@ def get_html_template() -> str:
             border-radius: 50%;
             transition: all 0.3s ease;
         }
-        
+
         .toggle input:checked + .toggle-slider {
             background: var(--accent-primary);
             border-color: var(--accent-primary);
         }
-        
+
         .toggle input:checked + .toggle-slider:before {
             transform: translateX(22px);
             background: white;
         }
-        
+
         /* Button */
         .btn {
             width: 100%;
@@ -1144,39 +1219,39 @@ def get_html_template() -> str:
             gap: 0.5rem;
             box-shadow: 0 4px 16px rgba(99, 102, 241, 0.4);
         }
-        
+
         .btn:hover:not(:disabled) {
             transform: translateY(-2px);
             box-shadow: 0 8px 24px rgba(99, 102, 241, 0.5);
         }
-        
+
         .btn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
         }
-        
+
         .btn-secondary {
             background: var(--bg-tertiary);
             border: 1px solid var(--border-color);
             box-shadow: none;
         }
-        
+
         .btn-secondary:hover:not(:disabled) {
             background: var(--bg-hover);
             box-shadow: none;
             transform: none;
         }
-        
+
         /* Progress bar */
         .progress-container {
             display: none;
             margin-top: 1rem;
         }
-        
+
         .progress-container.active {
             display: block;
         }
-        
+
         .progress-label {
             display: flex;
             justify-content: space-between;
@@ -1184,14 +1259,14 @@ def get_html_template() -> str:
             font-size: 0.85rem;
             color: var(--text-secondary);
         }
-        
+
         .progress-bar {
             height: 8px;
             background: var(--bg-tertiary);
             border-radius: 4px;
             overflow: hidden;
         }
-        
+
         .progress-fill {
             height: 100%;
             background: var(--accent-gradient);
@@ -1199,33 +1274,33 @@ def get_html_template() -> str:
             width: 0%;
             transition: width 0.3s ease;
         }
-        
+
         /* Result area */
         .result-panel {
             display: none;
         }
-        
+
         .result-panel.active {
             display: block;
         }
-        
+
         .result-actions {
             display: flex;
             gap: 1rem;
             margin-top: 1rem;
         }
-        
+
         .result-actions .btn {
             flex: 1;
         }
-        
+
         /* Collapsible section */
         .collapsible {
             border-top: 1px solid var(--border-color);
             margin-top: 1.5rem;
             padding-top: 1.5rem;
         }
-        
+
         .collapsible-header {
             display: flex;
             align-items: center;
@@ -1233,36 +1308,36 @@ def get_html_template() -> str:
             cursor: pointer;
             padding: 0.5rem 0;
         }
-        
+
         .collapsible-header h3 {
             font-size: 0.9rem;
             font-weight: 500;
             color: var(--text-secondary);
         }
-        
+
         .collapsible-content {
             display: none;
             margin-top: 1rem;
         }
-        
+
         .collapsible.open .collapsible-content {
             display: block;
         }
-        
+
         .collapsible-icon {
             transition: transform 0.3s ease;
         }
-        
+
         .collapsible.open .collapsible-icon {
             transform: rotate(180deg);
         }
-        
+
         /* Animations */
         @keyframes fadeIn {
             from { opacity: 0; }
             to { opacity: 1; }
         }
-        
+
         @keyframes fadeInDown {
             from {
                 opacity: 0;
@@ -1273,16 +1348,16 @@ def get_html_template() -> str:
                 transform: translateY(0);
             }
         }
-        
+
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
-        
+
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
-        
+
         .spinner {
             width: 20px;
             height: 20px;
@@ -1291,7 +1366,7 @@ def get_html_template() -> str:
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
         }
-        
+
         /* Comparison slider */
         .comparison-container {
             position: relative;
@@ -1301,7 +1376,7 @@ def get_html_template() -> str:
             cursor: ew-resize;
             user-select: none;
         }
-        
+
         .comparison-container img {
             position: absolute;
             inset: 0;
@@ -1310,21 +1385,21 @@ def get_html_template() -> str:
             object-fit: contain;
             pointer-events: none;
         }
-        
+
         .comparison-container img:not([src]),
         .comparison-container img[src=""] {
             display: none;
         }
-        
+
         .comparison-original {
             z-index: 1;
         }
-        
+
         .comparison-upscaled {
             z-index: 2;
             clip-path: inset(0 50% 0 0);
         }
-        
+
         .comparison-slider {
             position: absolute;
             top: 0;
@@ -1337,7 +1412,7 @@ def get_html_template() -> str:
             transform: translateX(-50%);
             box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
         }
-        
+
         .comparison-slider::before {
             content: "";
             position: absolute;
@@ -1350,7 +1425,7 @@ def get_html_template() -> str:
             border-radius: 50%;
             box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
         }
-        
+
         .comparison-slider::after {
             content: "◀ ▶";
             position: absolute;
@@ -1362,7 +1437,7 @@ def get_html_template() -> str:
             letter-spacing: 2px;
             white-space: nowrap;
         }
-        
+
         .comparison-labels {
             position: absolute;
             top: 1rem;
@@ -1374,7 +1449,7 @@ def get_html_template() -> str:
             z-index: 5;
             pointer-events: none;
         }
-        
+
         .comparison-label {
             background: rgba(0, 0, 0, 0.8);
             backdrop-filter: blur(8px);
@@ -1384,15 +1459,15 @@ def get_html_template() -> str:
             font-size: 0.75rem;
             color: var(--text-primary);
         }
-        
+
         .comparison-label.original {
             border: 1px solid var(--error);
         }
-        
+
         .comparison-label.upscaled {
             border: 1px solid var(--success);
         }
-        
+
         /* Footer */
         footer {
             text-align: center;
@@ -1400,16 +1475,16 @@ def get_html_template() -> str:
             color: var(--text-muted);
             font-size: 0.85rem;
         }
-        
+
         footer a {
             color: var(--accent-primary);
             text-decoration: none;
         }
-        
+
         footer a:hover {
             text-decoration: underline;
         }
-        
+
         /* Modal */
         .modal-overlay {
             display: none;
@@ -1424,13 +1499,13 @@ def get_html_template() -> str:
             overflow-y: auto;
             padding: 2rem;
         }
-        
+
         .modal-overlay.active {
             display: flex;
             align-items: flex-start;
             justify-content: center;
         }
-        
+
         .modal {
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -1440,7 +1515,7 @@ def get_html_template() -> str:
             margin: 2rem 0;
             animation: fadeInDown 0.3s ease-out;
         }
-        
+
         .modal-header {
             display: flex;
             align-items: center;
@@ -1448,7 +1523,7 @@ def get_html_template() -> str:
             padding: 1.5rem;
             border-bottom: 1px solid var(--border-color);
         }
-        
+
         .modal-title {
             font-size: 1.25rem;
             font-weight: 600;
@@ -1456,7 +1531,7 @@ def get_html_template() -> str:
             align-items: center;
             gap: 0.75rem;
         }
-        
+
         .modal-close {
             background: none;
             border: none;
@@ -1466,27 +1541,27 @@ def get_html_template() -> str:
             border-radius: 8px;
             transition: all 0.2s;
         }
-        
+
         .modal-close:hover {
             background: var(--bg-hover);
             color: var(--text-primary);
         }
-        
+
         .modal-body {
             padding: 1.5rem;
             max-height: 70vh;
             overflow-y: auto;
         }
-        
+
         /* API Docs styling */
         .api-section {
             margin-bottom: 2rem;
         }
-        
+
         .api-section:last-child {
             margin-bottom: 0;
         }
-        
+
         .api-endpoint {
             background: var(--bg-tertiary);
             border: 1px solid var(--border-color);
@@ -1494,7 +1569,7 @@ def get_html_template() -> str:
             margin-bottom: 1rem;
             overflow: hidden;
         }
-        
+
         .api-endpoint-header {
             display: flex;
             align-items: center;
@@ -1503,11 +1578,11 @@ def get_html_template() -> str:
             cursor: pointer;
             transition: background 0.2s;
         }
-        
+
         .api-endpoint-header:hover {
             background: var(--bg-hover);
         }
-        
+
         .api-method {
             font-family: var(--font-mono);
             font-size: 0.75rem;
@@ -1516,54 +1591,54 @@ def get_html_template() -> str:
             border-radius: 4px;
             text-transform: uppercase;
         }
-        
+
         .api-method.get {
             background: rgba(34, 197, 94, 0.2);
             color: var(--success);
         }
-        
+
         .api-method.post {
             background: rgba(99, 102, 241, 0.2);
             color: var(--accent-primary);
         }
-        
+
         .api-path {
             font-family: var(--font-mono);
             font-size: 0.9rem;
             color: var(--text-primary);
         }
-        
+
         .api-desc {
             color: var(--text-secondary);
             font-size: 0.85rem;
             margin-left: auto;
         }
-        
+
         .api-endpoint-body {
             display: none;
             padding: 1.25rem;
             border-top: 1px solid var(--border-color);
             background: rgba(0, 0, 0, 0.2);
         }
-        
+
         .api-endpoint.open .api-endpoint-body {
             display: block;
         }
-        
+
         .api-param-table {
             width: 100%;
             border-collapse: collapse;
             font-size: 0.85rem;
             margin-bottom: 1rem;
         }
-        
+
         .api-param-table th,
         .api-param-table td {
             text-align: left;
             padding: 0.75rem;
             border-bottom: 1px solid var(--border-color);
         }
-        
+
         .api-param-table th {
             color: var(--text-secondary);
             font-weight: 500;
@@ -1571,23 +1646,23 @@ def get_html_template() -> str:
             text-transform: uppercase;
             letter-spacing: 0.05em;
         }
-        
+
         .api-param-name {
             font-family: var(--font-mono);
             color: var(--accent-primary);
         }
-        
+
         .api-param-type {
             font-family: var(--font-mono);
             color: var(--text-muted);
             font-size: 0.8rem;
         }
-        
+
         .api-param-required {
             color: var(--error);
             font-size: 0.75rem;
         }
-        
+
         .code-block {
             background: var(--bg-primary);
             border: 1px solid var(--border-color);
@@ -1599,12 +1674,12 @@ def get_html_template() -> str:
             white-space: pre;
             color: var(--text-secondary);
         }
-        
+
         .code-block .keyword { color: #c678dd; }
         .code-block .string { color: #98c379; }
         .code-block .number { color: #d19a66; }
         .code-block .comment { color: #5c6370; }
-        
+
         h4 {
             font-size: 0.9rem;
             font-weight: 600;
@@ -1616,7 +1691,7 @@ def get_html_template() -> str:
 <body>
     <div class="bg-gradient"></div>
     <div class="noise-overlay"></div>
-    
+
     <div class="container">
         <header>
             <div class="logo">
@@ -1625,7 +1700,7 @@ def get_html_template() -> str:
             </div>
             <p class="subtitle">AI-powered image upscaling with diffusion models</p>
         </header>
-        
+
         <div class="status-bar">
             <div class="status-item">
                 <span class="status-dot" id="status-dot"></span>
@@ -1648,7 +1723,7 @@ def get_html_template() -> str:
                 <span id="loaded-model-text">No model</span>
             </div>
         </div>
-        
+
         <div class="main-grid">
             <!-- Image Panel -->
             <div class="panel">
@@ -1675,13 +1750,13 @@ def get_html_template() -> str:
                         <p class="upload-text">Drop an image here or click to upload</p>
                         <p class="upload-hint">Supports PNG, JPG, WEBP • Max 50MB</p>
                         <input type="file" id="file-input" accept="image/*">
-                        
+
                         <div class="image-preview" id="image-preview">
                             <!-- Standard preview mode -->
                             <div class="preview-container" id="preview-container">
                                 <img src="" alt="Preview" class="preview-img" id="preview-img">
                             </div>
-                            
+
                             <!-- Comparison mode -->
                             <div class="preview-container comparison-container" id="comparison-container" style="display: none;">
                                 <img src="" alt="Original" class="comparison-original" id="comparison-original">
@@ -1692,7 +1767,7 @@ def get_html_template() -> str:
                                     <span class="comparison-label upscaled">Upscaled</span>
                                 </div>
                             </div>
-                            
+
                             <div class="image-info" id="image-info"></div>
                             <button class="clear-btn" id="clear-btn">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1704,7 +1779,7 @@ def get_html_template() -> str:
                     </div>
                 </div>
             </div>
-            
+
             <!-- Settings Panel -->
             <div class="panel">
                 <div class="panel-header">
@@ -1724,7 +1799,7 @@ def get_html_template() -> str:
                             <span class="range-value" id="resolution-value">2160px</span>
                         </div>
                     </div>
-                    
+
                     <div class="settings-group">
                         <label class="setting-label">Max Resolution (0 = no limit)</label>
                         <div class="range-container">
@@ -1732,7 +1807,7 @@ def get_html_template() -> str:
                             <span class="range-value" id="max-resolution-value">4096px</span>
                         </div>
                     </div>
-                    
+
                     <div class="settings-group">
                         <label class="setting-label">Color Correction</label>
                         <select id="color-correction">
@@ -1744,7 +1819,16 @@ def get_html_template() -> str:
                             <option value="none">None</option>
                         </select>
                     </div>
-                    
+
+                    <div class="settings-group">
+                        <label class="setting-label">Output Format</label>
+                        <select id="output-format">
+                            <option value="png" selected>PNG</option>
+                            <option value="jpeg">JPEG</option>
+                            <option value="jxl">JPEG XL</option>
+                        </select>
+                    </div>
+
                     <div class="settings-group">
                         <label class="setting-label">Model</label>
                         <select id="dit-model">
@@ -1760,12 +1844,12 @@ def get_html_template() -> str:
                             <div id="model-details" style="margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-muted); line-height: 1.4;"></div>
                         </details>
                     </div>
-                    
+
                     <div class="settings-group">
                         <label class="setting-label">Seed</label>
                         <input type="number" id="seed" value="42" min="0" max="999999999">
                     </div>
-                    
+
                     <div class="collapsible" id="advanced-settings">
                         <div class="collapsible-header">
                             <h3>Advanced Settings</h3>
@@ -1786,12 +1870,12 @@ def get_html_template() -> str:
                                     Enable for high resolution outputs (reduces VRAM usage)
                                 </p>
                             </div>
-                            
+
                             <div class="settings-group">
                                 <label class="setting-label">VAE Tile Size</label>
                                 <input type="number" id="vae-tile-size" value="1024" min="256" max="2048" step="64">
                             </div>
-                            
+
                             <div class="settings-group">
                                 <label class="setting-label">BlockSwap (VRAM savings)</label>
                                 <div class="range-container">
@@ -1802,7 +1886,7 @@ def get_html_template() -> str:
                                     Higher = less VRAM but slower. Use for 8GB GPUs.
                                 </p>
                             </div>
-                            
+
                             <div class="settings-group">
                                 <div class="toggle-container">
                                     <span class="setting-label" style="margin-bottom: 0;">Keep Models in VRAM</span>
@@ -1815,9 +1899,19 @@ def get_html_template() -> str:
                                     Faster repeated upscaling (uses ~8GB VRAM)
                                 </p>
                             </div>
+
+                            <div class="settings-group" style="margin-top: 1rem;">
+                                <button class="btn btn-secondary" id="clear-outputs-btn" style="font-size: 0.9rem; padding: 0.5rem 1rem;">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 0.5rem;">
+                                        <polyline points="3 6 5 6 21 6"></polyline>
+                                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                                    </svg>
+                                    Clear Generated Images
+                                </button>
+                            </div>
                         </div>
                     </div>
-                    
+
                     <button class="btn" id="upscale-btn" disabled>
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline>
@@ -1825,7 +1919,7 @@ def get_html_template() -> str:
                         </svg>
                         Upscale Image
                     </button>
-                    
+
                     <div class="progress-container" id="progress-container">
                         <div class="progress-label">
                             <span id="progress-phase">Preparing...</span>
@@ -1835,7 +1929,7 @@ def get_html_template() -> str:
                             <div class="progress-fill" id="progress-fill"></div>
                         </div>
                     </div>
-                    
+
                     <div class="result-panel" id="result-panel">
                         <div class="result-actions">
                             <button class="btn" id="download-btn">
@@ -1854,14 +1948,14 @@ def get_html_template() -> str:
                 </div>
             </div>
         </div>
-        
+
         <footer>
-            Powered by <a href="https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler" target="_blank">SeedVR2</a> • 
-            AI upscaling with diffusion models • 
+            Powered by <a href="https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler" target="_blank">SeedVR2</a> •
+            AI upscaling with diffusion models •
             <a href="#" id="api-docs-link">API Documentation</a>
         </footer>
     </div>
-    
+
     <!-- API Documentation Modal -->
     <div class="modal-overlay" id="api-modal">
         <div class="modal">
@@ -1886,7 +1980,7 @@ def get_html_template() -> str:
             <div class="modal-body">
                 <div class="api-section">
                     <h3 style="margin-bottom: 1rem; color: var(--text-secondary);">Endpoints</h3>
-                    
+
                     <!-- POST /api/upscale -->
                     <div class="api-endpoint" id="endpoint-upscale">
                         <div class="api-endpoint-header" onclick="toggleEndpoint('endpoint-upscale')">
@@ -1954,40 +2048,25 @@ def get_html_template() -> str:
                                         <td>true</td>
                                         <td>Keep models in VRAM for faster inference</td>
                                     </tr>
+                                    <tr>
+                                        <td><span class="api-param-name">output_format</span></td>
+                                        <td><span class="api-param-type">string</span></td>
+                                        <td>png</td>
+                                        <td>Output format (png, jpeg, jxl)</td>
+                                    </tr>
                                 </tbody>
                             </table>
-                            
-                            <h4>Response</h4>
-                            <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1rem;">Returns PNG image with headers:</p>
-                            <div class="code-block">X-Processing-Time: 5.23s
-X-Output-Resolution: 1920x1080</div>
-                            
-                            <h4 style="margin-top: 1rem;">Example (cURL)</h4>
-                            <div class="code-block">curl -X POST "http://localhost:8000/api/upscale" \\
-  -F "file=@image.jpg" \\
-  -F "resolution=2160" \\
-  -F "max_resolution=4096" \\
-  -F "color_correction=lab" \\
-  -o upscaled.png</div>
-                            
-                            <h4 style="margin-top: 1rem;">Example (Python)</h4>
-                            <div class="code-block"><span class="keyword">import</span> requests
 
-response = requests.post(
-    <span class="string">"http://localhost:8000/api/upscale"</span>,
-    files={<span class="string">"file"</span>: open(<span class="string">"image.jpg"</span>, <span class="string">"rb"</span>)},
-    data={
-        <span class="string">"resolution"</span>: <span class="number">2160</span>,
-        <span class="string">"max_resolution"</span>: <span class="number">4096</span>,
-        <span class="string">"color_correction"</span>: <span class="string">"lab"</span>
-    }
-)
-
-<span class="keyword">with</span> open(<span class="string">"upscaled.png"</span>, <span class="string">"wb"</span>) <span class="keyword">as</span> f:
-    f.write(response.content)</div>
+                            <h4>Response (JSON)</h4>
+                            <div class="code-block">{
+    "filename": "upscaled_xyz.png",
+    "url": "/outputs/upscaled_xyz.png",
+    "processing_time": "5.23s",
+    "output_resolution": "1920x1080"
+}</div>
                         </div>
                     </div>
-                    
+
                     <!-- POST /api/upscale_base64 -->
                     <div class="api-endpoint" id="endpoint-base64">
                         <div class="api-endpoint-header" onclick="toggleEndpoint('endpoint-base64')">
@@ -2016,7 +2095,7 @@ response = requests.post(
                                     </tr>
                                 </tbody>
                             </table>
-                            
+
                             <h4>Response (JSON)</h4>
                             <div class="code-block">{
   <span class="string">"success"</span>: <span class="keyword">true</span>,
@@ -2026,7 +2105,7 @@ response = requests.post(
 }</div>
                         </div>
                     </div>
-                    
+
                     <!-- GET /api/models -->
                     <div class="api-endpoint" id="endpoint-models">
                         <div class="api-endpoint-header" onclick="toggleEndpoint('endpoint-models')">
@@ -2047,7 +2126,7 @@ response = requests.post(
 }</div>
                         </div>
                     </div>
-                    
+
                     <!-- GET /api/status -->
                     <div class="api-endpoint" id="endpoint-status">
                         <div class="api-endpoint-header" onclick="toggleEndpoint('endpoint-status')">
@@ -2065,7 +2144,7 @@ response = requests.post(
 }</div>
                         </div>
                     </div>
-                    
+
                     <!-- POST /api/clear_cache -->
                     <div class="api-endpoint" id="endpoint-cache">
                         <div class="api-endpoint-header" onclick="toggleEndpoint('endpoint-cache')">
@@ -2082,25 +2161,26 @@ response = requests.post(
                         </div>
                     </div>
                 </div>
-                
+
                 <div class="api-section">
                     <h3 style="margin-bottom: 1rem; color: var(--text-secondary);">OpenAPI / Swagger</h3>
                     <p style="font-size: 0.9rem; color: var(--text-secondary);">
-                        Interactive API documentation is available at 
-                        <a href="/docs" target="_blank">/docs</a> (Swagger UI) or 
+                        Interactive API documentation is available at
+                        <a href="/docs" target="_blank">/docs</a> (Swagger UI) or
                         <a href="/redoc" target="_blank">/redoc</a> (ReDoc).
                     </p>
                 </div>
             </div>
         </div>
     </div>
-    
+
     <script>
         // State
         let currentFile = null;
-        let resultBlob = null;
+        let resultUrl = null;
+        let resultFilename = null;
         let isProcessing = false;
-        
+
         // DOM elements
         const uploadZone = document.getElementById('upload-zone');
         const fileInput = document.getElementById('file-input');
@@ -2127,10 +2207,12 @@ response = requests.post(
         const advancedSettings = document.getElementById('advanced-settings');
         const modelInfoText = document.getElementById('model-info');
         const modelDetails = document.getElementById('model-details');
-        
+        const clearOutputsBtn = document.getElementById('clear-outputs-btn');
+        const outputFormatSelect = document.getElementById('output-format');
+
         // Model metadata (populated from /api/models)
         let modelInfoMap = {};
-        
+
         function escapeHtml(str) {
             return (str || '')
                 .replace(/&/g, '&amp;')
@@ -2139,56 +2221,56 @@ response = requests.post(
                 .replace(/"/g, '&quot;')
                 .replace(/'/g, '&#39;');
         }
-        
+
         function getShortName(model) {
             return model
                 .replace('seedvr2_ema_', '')
                 .replace('.safetensors', '')
                 .replace('.gguf', ' (GGUF)');
         }
-        
+
         function updateModelInfo() {
             if (!modelInfoText) return;
-            
+
             const model = ditModelSelect.value;
             if (!model) {
                 modelInfoText.textContent = '';
                 return;
             }
-            
+
             const info = modelInfoMap[model];
             const parts = [];
             if (info && info.size) parts.push(info.size);
             if (info && info.description) parts.push(info.description);
-            
+
             modelInfoText.textContent = parts.length > 0
                 ? parts.join(' • ')
                 : 'No metadata available for this model.';
         }
-        
+
         function renderModelDetails(models) {
             if (!modelDetails) return;
             if (!models || models.length === 0) {
                 modelDetails.textContent = 'No models found.';
                 return;
             }
-            
+
             const groups = { "7B": [], "3B": [], "Other": [] };
-            
+
             models.forEach(m => {
                 const info = modelInfoMap[m] || {};
                 const lower = (m || '').toLowerCase();
                 const size = info.size || (lower.includes('7b') ? '7B' : (lower.includes('3b') ? '3B' : 'Other'));
                 (groups[size] || groups.Other).push(m);
             });
-            
+
             const order = ['7B', '3B', 'Other'];
             let html = '';
-            
+
             order.forEach(size => {
                 const list = groups[size] || [];
                 if (list.length === 0) return;
-                
+
                 const title = size === 'Other' ? 'Other models' : (size + ' models');
                 html +=
                     '<div style="margin-top: 0.5rem;">' +
@@ -2202,21 +2284,21 @@ response = requests.post(
                         '</ul>' +
                     '</div>';
             });
-            
+
             modelDetails.innerHTML = html;
         }
-        
+
         // Initialize
         async function init() {
             await updateStatus();
-            
+
             // Fetch models
             try {
                 const response = await fetch('/api/models');
                 const data = await response.json();
-                
+
                 modelInfoMap = data.info || {};
-                
+
                 ditModelSelect.innerHTML = data.models.map(model => {
                     // Shorten model names for display
                     const shortName = getShortName(model);
@@ -2224,27 +2306,27 @@ response = requests.post(
                     const label = (info && info.size) ? ('[' + info.size + '] ' + shortName) : shortName;
                     return '<option value="' + model + '"' + (model === data.default ? ' selected' : '') + '>' + label + '</option>';
                 }).join('');
-                
+
                 updateModelInfo();
                 renderModelDetails(data.models);
             } catch (e) {
                 console.error('Failed to fetch models:', e);
             }
         }
-        
+
         async function updateStatus() {
             try {
                 const response = await fetch('/api/status');
                 const status = await response.json();
-                
+
                 document.getElementById('status-dot').className = 'status-dot';
                 document.getElementById('status-text').textContent = status.status === 'ready' ? 'Ready' : 'Loading...';
                 document.getElementById('gpu-text').textContent = status.gpu_info;
-                
+
                 // Show loaded model
                 const modelStatus = document.getElementById('model-status');
                 const loadedModelText = document.getElementById('loaded-model-text');
-                
+
                 if (status.loaded_model) {
                     const shortName = status.loaded_model.replace('seedvr2_ema_', '').replace('.safetensors', '').replace('.gguf', ' (GGUF)');
                     loadedModelText.textContent = shortName;
@@ -2257,64 +2339,78 @@ response = requests.post(
                 document.getElementById('status-text').textContent = 'Error';
             }
         }
-        
+
         // Event listeners
         ditModelSelect.addEventListener('change', updateModelInfo);
-        
+
         uploadZone.addEventListener('click', (e) => {
             if (!imagePreview.classList.contains('active')) {
                 fileInput.click();
             }
         });
-        
+
         uploadZone.addEventListener('dragover', (e) => {
             e.preventDefault();
             uploadZone.classList.add('dragover');
         });
-        
+
         uploadZone.addEventListener('dragleave', () => {
             uploadZone.classList.remove('dragover');
         });
-        
+
         uploadZone.addEventListener('drop', (e) => {
             e.preventDefault();
             uploadZone.classList.remove('dragover');
-            
+
             if (e.dataTransfer.files.length > 0) {
                 handleFile(e.dataTransfer.files[0]);
             }
         });
-        
+
         fileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) {
                 handleFile(e.target.files[0]);
             }
         });
-        
+
         clearBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             resetUI();
         });
-        
+
         upscaleBtn.addEventListener('click', () => {
             if (!isProcessing && currentFile) {
                 processImage();
             }
         });
-        
+
         downloadBtn.addEventListener('click', () => {
-            if (resultBlob) {
-                const url = URL.createObjectURL(resultBlob);
+            if (resultUrl) {
                 const a = document.createElement('a');
-                a.href = url;
-                a.download = 'upscaled_' + currentFile.name.replace(/[.][^/.]+$/, '') + '.png';
+                a.href = resultUrl;
+                a.download = resultFilename || 'upscaled.png';
                 a.click();
-                URL.revokeObjectURL(url);
             }
         });
-        
+
         newBtn.addEventListener('click', resetUI);
-        
+
+        clearOutputsBtn.addEventListener('click', async () => {
+            if (!confirm('Are you sure you want to delete all generated images? This cannot be undone.')) return;
+
+            try {
+                const response = await fetch('/api/clear_outputs', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    alert('Output history cleared successfully.');
+                } else {
+                    alert('Failed to clear output history: ' + (data.detail || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Error clearing output history: ' + e.message);
+            }
+        });
+
         // Comparison slider functionality
         const comparisonContainer = document.getElementById('comparison-container');
         const previewContainer = document.getElementById('preview-container');
@@ -2343,13 +2439,13 @@ response = requests.post(
         comparisonUpscaled.addEventListener('load', () => {
             setFrameAspect(comparisonUpscaled.naturalWidth, comparisonUpscaled.naturalHeight);
         });
-        
+
         compareBtn.addEventListener('click', () => {
             // Only allow comparison if we have both original and upscaled images
-            if (!resultBlob || !previewImg.dataset.originalSrc) {
+            if (!resultUrl || !previewImg.dataset.originalSrc) {
                 return;
             }
-            
+
             if (!isComparing) {
                 // Ensure comparison images are always up-to-date
                 comparisonOriginal.src = previewImg.dataset.originalSrc;
@@ -2365,87 +2461,88 @@ response = requests.post(
                 // Switch back to result view
                 comparisonContainer.style.display = 'none';
                 previewContainer.style.display = 'flex';
-                previewImg.src = URL.createObjectURL(resultBlob);
+                previewImg.src = resultUrl;
                 compareBtn.textContent = 'Compare';
                 isComparing = false;
             }
         });
-        
+
         function updateSliderPosition(percentage) {
             percentage = Math.max(0, Math.min(100, percentage));
             comparisonSlider.style.left = percentage + '%';
             comparisonUpscaled.style.clipPath = 'inset(0 ' + (100 - percentage) + '% 0 0)';
         }
-        
+
         comparisonContainer.addEventListener('mousedown', (e) => {
             isDragging = true;
             updateSliderFromEvent(e);
         });
-        
+
         comparisonContainer.addEventListener('touchstart', (e) => {
             isDragging = true;
             updateSliderFromEvent(e.touches[0]);
         });
-        
+
         document.addEventListener('mousemove', (e) => {
             if (isDragging) {
                 updateSliderFromEvent(e);
             }
         });
-        
+
         document.addEventListener('touchmove', (e) => {
             if (isDragging) {
                 updateSliderFromEvent(e.touches[0]);
             }
         });
-        
+
         document.addEventListener('mouseup', () => {
             isDragging = false;
         });
-        
+
         document.addEventListener('touchend', () => {
             isDragging = false;
         });
-        
+
         function updateSliderFromEvent(e) {
             const rect = comparisonContainer.getBoundingClientRect();
             const x = e.clientX - rect.left;
             const percentage = (x / rect.width) * 100;
             updateSliderPosition(percentage);
         }
-        
+
         advancedSettings.querySelector('.collapsible-header').addEventListener('click', () => {
             advancedSettings.classList.toggle('open');
         });
-        
+
         resolutionSlider.addEventListener('input', () => {
             resolutionValue.textContent = resolutionSlider.value + 'px';
         });
-        
+
         maxResolutionSlider.addEventListener('input', () => {
             const val = parseInt(maxResolutionSlider.value);
             maxResolutionValue.textContent = val === 0 ? 'None' : val + 'px';
         });
-        
+
         blocksSlider.addEventListener('input', () => {
             blocksValue.textContent = blocksSlider.value;
         });
-        
+
         // Functions
         function handleFile(file) {
             if (!file.type.startsWith('image/')) {
                 alert('Please upload an image file');
                 return;
             }
-            
+
             if (file.size > 50 * 1024 * 1024) {
                 alert('File too large. Maximum size is 50MB.');
                 return;
             }
-            
+
             currentFile = file;
-            resultBlob = null;  // Clear any previous result when new file is uploaded
-            
+            resultUrl = null;  // Clear any previous result when new file is uploaded
+            resultFilename = null;
+
             const reader = new FileReader();
             reader.onload = (e) => {
                 const img = new Image();
@@ -2454,16 +2551,16 @@ response = requests.post(
                     previewImg.dataset.originalSrc = e.target.result;  // Store for comparison
                     setFrameAspect(img.width, img.height);
                     imageInfo.textContent = img.width + ' × ' + img.height + 'px • ' + (file.size / 1024 / 1024).toFixed(2) + 'MB';
-                    
+
                     imagePreview.classList.add('active');
                     uploadZone.classList.add('has-image');
                     upscaleBtn.disabled = false;
                     resultPanel.classList.remove('active');
-                    
+
                     // Reset compare button
                     compareBtn.style.display = 'none';
                     compareBtn.textContent = 'Compare';
-                    
+
                     // Reset comparison state
                     previewContainer.style.display = 'flex';
                     comparisonContainer.style.display = 'none';
@@ -2475,10 +2572,11 @@ response = requests.post(
             };
             reader.readAsDataURL(file);
         }
-        
+
         function resetUI() {
             currentFile = null;
-            resultBlob = null;
+            resultUrl = null;
+            resultFilename = null;
             fileInput.value = '';
             previewImg.src = '';
             previewImg.dataset.originalSrc = '';
@@ -2488,7 +2586,7 @@ response = requests.post(
             upscaleBtn.disabled = true;
             progressContainer.classList.remove('active');
             resultPanel.classList.remove('active');
-            
+
             // Reset frame aspect ratio to default
             previewContainer.style.aspectRatio = '';
             comparisonContainer.style.aspectRatio = '';
@@ -2496,7 +2594,7 @@ response = requests.post(
             // Reset compare button
             compareBtn.style.display = 'none';
             compareBtn.textContent = 'Compare';
-            
+
             // Reset comparison
             comparisonOriginal.src = '';
             comparisonUpscaled.src = '';
@@ -2504,15 +2602,15 @@ response = requests.post(
             previewContainer.style.display = 'flex';
             isComparing = false;
         }
-        
+
         async function processImage() {
             if (!currentFile || isProcessing) return;
-            
+
             isProcessing = true;
             upscaleBtn.disabled = true;
             upscaleBtn.innerHTML = '<span class="spinner"></span> Processing...';
             progressContainer.classList.add('active');
-            
+
             // Simulate progress phases
             const phases = [
                 { name: 'Downloading models...', duration: 500 },
@@ -2521,7 +2619,7 @@ response = requests.post(
                 { name: 'Decoding...', progress: 75 },
                 { name: 'Post-processing...', progress: 90 }
             ];
-            
+
             let phaseIndex = 0;
             const updateProgress = () => {
                 if (phaseIndex < phases.length) {
@@ -2536,7 +2634,7 @@ response = requests.post(
                 }
             };
             updateProgress();
-            
+
             try {
                 const formData = new FormData();
                 formData.append('file', currentFile);
@@ -2549,20 +2647,24 @@ response = requests.post(
                 formData.append('blocks_to_swap', blocksSlider.value);
                 formData.append('seed', document.getElementById('seed').value);
                 formData.append('cache_models', document.getElementById('cache-models').checked);
-                
+                formData.append('output_format', outputFormatSelect.value);
+
                 const response = await fetch('/api/upscale', {
                     method: 'POST',
                     body: formData
                 });
-                
+
                 if (!response.ok) {
                     const error = await response.json();
                     throw new Error(error.detail || 'Upscaling failed');
                 }
-                
-                resultBlob = await response.blob();
-                const processingTime = response.headers.get('X-Processing-Time');
-                const outputRes = response.headers.get('X-Output-Resolution');
+
+                const data = await response.json();
+                resultUrl = data.url;
+                resultFilename = data.filename;
+
+                const processingTime = data.processing_time;
+                const outputRes = data.output_resolution;
 
                 // Update frame aspect ratio early (before image load) to avoid side gutters
                 if (outputRes) {
@@ -2571,29 +2673,28 @@ response = requests.post(
                         setFrameAspect(parseInt(m[1], 10), parseInt(m[2], 10));
                     }
                 }
-                
+
                 // Show result
-                const resultUrl = URL.createObjectURL(resultBlob);
                 previewImg.src = resultUrl;
-                
+
                 // Setup comparison images
                 comparisonOriginal.src = previewImg.dataset.originalSrc || previewImg.src;
                 comparisonUpscaled.src = resultUrl;
-                
+
                 imageInfo.textContent = outputRes + ' • ' + processingTime;
-                
+
                 progressPercent.textContent = '100%';
                 progressFill.style.width = '100%';
                 progressPhase.textContent = 'Complete!';
-                
+
                 resultPanel.classList.add('active');
                 compareBtn.style.display = 'block';
                 compareBtn.textContent = 'Compare';
                 isComparing = false;
-                
+
                 // Update status to show loaded model
                 updateStatus();
-                
+
             } catch (error) {
                 alert('Error: ' + error.message);
                 progressContainer.classList.remove('active');
@@ -2609,35 +2710,35 @@ response = requests.post(
                 `;
             }
         }
-        
+
         // API Documentation Modal
         const apiModal = document.getElementById('api-modal');
         const apiDocsLink = document.getElementById('api-docs-link');
         const apiModalClose = document.getElementById('api-modal-close');
-        
+
         apiDocsLink.addEventListener('click', (e) => {
             e.preventDefault();
             apiModal.classList.add('active');
             document.body.style.overflow = 'hidden';
         });
-        
+
         apiModalClose.addEventListener('click', () => {
             apiModal.classList.remove('active');
             document.body.style.overflow = '';
         });
-        
+
         apiModal.addEventListener('click', (e) => {
             if (e.target === apiModal) {
                 apiModal.classList.remove('active');
                 document.body.style.overflow = '';
             }
         });
-        
+
         function toggleEndpoint(id) {
             const endpoint = document.getElementById(id);
             endpoint.classList.toggle('open');
         }
-        
+
         // Close modal on Escape key
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && apiModal.classList.contains('active')) {
@@ -2645,43 +2746,45 @@ response = requests.post(
                 document.body.style.overflow = '';
             }
         });
-        
+
         // Ensure clean initial UI state on page load
         function ensureCleanState() {
             // Reset all state variables
             currentFile = null;
-            resultBlob = null;
+            resultUrl = null;
+            resultFilename = null;
             isProcessing = false;
-            
+
             // Hide compare button until we have a result
             compareBtn.style.display = 'none';
             compareBtn.textContent = 'Compare';
-            
+
             // Reset frame aspect ratio to default
             previewContainer.style.aspectRatio = '';
             comparisonContainer.style.aspectRatio = '';
-            
+
             // Ensure not in comparison mode
             comparisonContainer.style.display = 'none';
+            comparisonContainer.style.display = 'none';
             previewContainer.style.display = 'flex';
-            
+
             // Reset image preview
             imagePreview.classList.remove('active');
             uploadZone.classList.remove('has-image');
             previewImg.src = '';
             previewImg.dataset.originalSrc = '';
             imageInfo.textContent = '';
-            
+
             // Reset comparison images
             comparisonOriginal.src = '';
             comparisonUpscaled.src = '';
-            
+
             // Reset result panel
             resultPanel.classList.remove('active');
             progressContainer.classList.remove('active');
             upscaleBtn.disabled = true;
         }
-        
+
         // Handle bfcache (back-forward cache) restoration
         window.addEventListener('pageshow', (event) => {
             if (event.persisted) {
@@ -2690,7 +2793,7 @@ response = requests.post(
                 init();
             }
         });
-        
+
         // Initialize on load
         ensureCleanState();
         init();
@@ -2710,7 +2813,7 @@ def parse_arguments():
         description="SeedVR2 Image Upscaler - Web UI and API",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    
+
     parser.add_argument("--host", type=str, default="127.0.0.1",
                        help="Host to bind to (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000,
@@ -2719,17 +2822,17 @@ def parse_arguments():
                        help="Enable debug logging")
     parser.add_argument("--reload", action="store_true",
                        help="Enable auto-reload for development")
-    
+
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
     args = parse_arguments()
-    
+
     # Update debug instance
     debug.enabled = args.debug
-    
+
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                   SeedVR2 Image Upscaler                     ║
@@ -2739,7 +2842,7 @@ def main():
 ║  API Docs:     http://{args.host}:{args.port}/docs{' ' * 16}       ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
-    
+
     uvicorn.run(
         "webui:app" if args.reload else app,
         host=args.host,
@@ -2751,4 +2854,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
