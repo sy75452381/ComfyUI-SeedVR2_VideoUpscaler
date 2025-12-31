@@ -56,6 +56,8 @@ import cv2
 import numpy as np
 import imageio
 import imagecodecs
+from PIL import Image
+import pillow_jxl
 
 # Project imports
 from src.utils.downloads import download_weight
@@ -201,12 +203,10 @@ def save_image_to_disk(tensor: torch.Tensor, format: str) -> str:
     filepath = os.path.join(OUTPUTS_DIR, filename)
 
     if format == 'jxl':
-        # Use imageio with imagecodecs for JXL
+        # Use PIL with pillow-jxl-plugin for JXL
         try:
-            # ImageIO expects RGB, not BGR
-            # Our tensor is RGB, but if we used cv2 conversions before we need to be careful.
-            # tensor is [H, W, C] RGB(A)
-            imageio.imwrite(filepath, frame_uint8, format='jxl')
+            # PIL expects RGB, which frame_uint8 already is
+            Image.fromarray(frame_uint8).save(filepath)
         except Exception as e:
             # Fallback if possible or raise
             raise ValueError(f"Failed to save JXL: {e}")
