@@ -747,7 +747,7 @@ async def clear_outputs():
 
 def get_html_template() -> str:
     """Generate the web UI HTML template."""
-    return """
+    return r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
