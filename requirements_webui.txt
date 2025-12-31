@@ -10,7 +10,7 @@ python-multipart>=0.0.6
 torch
 torchvision
 safetensors
-numpy
+numpy<2
 tqdm
 psutil
 einops
